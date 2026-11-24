@@ -10,7 +10,7 @@
 - Source/native/pir_native/pir_native.c 및 simple_buffer_native.c: open/read/write/close
 - Source/driver/pir_driver/Makefile: KDIR, PWD, SUBDIRS
 
-## 수업 예제와 다른 부분 및 이유
+## 수업 예제와 다른 부분
 - del_timer_sync: 콜백 종료까지 기다려 이전 상태의 LED 출력 및 제거 후 접근을 방지한다.
 - gpio_set_value: 초기화 시 출력 방향을 설정한 뒤 값만 변경한다. 타이머에서는 잠드는 GPIO를 사용할 수 없어 cansleep 검사도 둔다(커널 버전에 따라 API 분기).
 - kfifo_out_peek: 사용자 공간 복사 실패 시 이벤트를 잃지 않도록 먼저 조회한 후 성공 시 전체 레코드를 제거한다.
@@ -24,7 +24,6 @@
 
 ## 실행
 ```sh
-uname -r
 make
 sudo insmod guard.ko
 sudo mknod /dev/guard c 241 0 # 기존 장치 파일이 없을 때만
@@ -34,6 +33,7 @@ sudo chmod 666 /dev/guard
 arm / disarm / panic / quit 명령을 지원한다. 이벤트는 guard.log에 추가 기록한다.
 
 별도 터미널에서 cat /dev/guard 및 echo ARM > /dev/guard 등의 명령으로 검사할 수 있다. 이벤트 FIFO는 소비형이므로 guard_ctl과 cat은 동시에 사용하지 않는 것이 좋다.
+sudo rmmod guard.ko
 
 ## 검증 및 제거
 1. 초기 LED OFF, ARM 후 5초 카운트다운과 LED3 ON 확인.
@@ -45,8 +45,5 @@ arm / disarm / panic / quit 명령을 지원한다. 이벤트는 guard.log에 �
 
 THIS_MODULE을 유지하므로 열린 파일이 있는 상태에서는 정상 rmmod가 거부된다. 강제 제거하지 않는다. 과제의 열린 cat 상태 제거 채점 조건이 실제 제거 성공을 요구한다면 별도 확인이 필요하다.
 
-## 검증 범위
-Linux 6.12.107 x86-64 헤더에서 커널 모듈 및 사용자 프로그램 빌드 성공. 실제 ES-101 커널에서의 빌드/동작은 미검증. 보드에서 make 및 위 검증을 수행해야 한다.
-
 ## AI 사용 내역
-ChatGPT를 사용하여 제공된 수업 예제와 기존 구현의 API를 대조하고, FIFO 및 타이머 방식 수정, 한글 주석 작성, 빌드 검증을 수행했다.
+ChatGPT를 사용하여 제공된 수업 예제와 기존 구현의 API를 대조하고, FIFO 및 타이머 방식 수정, 한글 주석 작성을 수행했다.
