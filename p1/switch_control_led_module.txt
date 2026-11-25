@@ -1,0 +1,398 @@
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/gpio.h>
+#include <linux/interrupt.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/spinlock.h>
+#include <linux/errno.h>
+
+#define HIGH	1
+#define LOW 	0
+
+#define FWD	0
+#define REV	1
+
+#define A	0 //A 단계 
+#define B	1 //B 단계 
+#define C	2 //C 단계 
+
+#define DEBOUNCE_MS 200
+
+static int sw[4] = {4, 17, 27, 22};
+static int led[4] = {23, 24, 25, 1};
+
+// 현재 설정
+static int pattern = A;
+static int period_ms = 1000;
+static int dir = FWD;
+static int step = 0;
+static int run = 1;
+
+static DEFINE_SPINLOCK(seq_lock);
+
+// 스위치 디바운싱
+static unsigned long last_sw_jiffies[4];
+static int sw_pressed[4] = {0, 0, 0, 0};
+
+// IRQ 및 GPIO 등록 상태
+static int irq_num[4];
+static int sw_requested[4] = {0, 0, 0, 0};
+static int led_requested[4] = {0, 0, 0, 0};
+static int irq_requested[4] = {0, 0, 0, 0};
+
+static struct timer_list timer;
+
+
+// 패턴별 단계 수 
+static int get_step_count(int p)
+{
+    switch (p) {
+        case A:
+            return 4;
+
+        case B:
+            return 5;
+
+        case C:
+            return 16;
+
+        default:
+            return 0;
+    }
+}
+
+
+// 패턴 & 단계 해당하는 LED 계산
+static int get_led_pattern(int p, int s)
+{
+    switch (p) {
+        case A:
+            // 1000 -> 0100 -> 0010 -> 0001
+            return 1 << (3 - s);
+
+        case B:
+            switch (s) {
+                case 0: 
+					return 0;//0000
+                case 1: 
+					return 8;//1000
+                case 2: 
+					return 12;//1100
+                case 3: 
+					return 14;//1110
+                case 4: 
+					return 15;//1111
+            }
+            break;
+
+        case C:
+            // 이진 
+            return s;
+    }
+
+    return 0;
+}
+
+
+// LED 출력
+static void led_output(int value)
+{
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        if (value & (1 << (3 - i)))
+            gpio_set_value(led[i], HIGH);
+        else
+            gpio_set_value(led[i], LOW);
+    }
+}
+
+
+/* 타이머 콜백 */
+static void timer_cb(struct timer_list *timer)
+{
+    unsigned long flags;
+    int current_pattern;
+    int current_step;
+    int current_dir;
+    int current_run;
+    int current_period;
+    int led_value;
+    int max_step;
+
+    spin_lock_irqsave(&seq_lock, flags);
+
+    current_pattern = pattern;
+    current_step = step;
+    current_dir = dir;
+    current_run = run;
+    current_period = period_ms;
+
+    max_step = get_step_count(current_pattern);
+
+    if (current_run == 1 && max_step > 0) {
+
+        // 현재 단계의 LED 값 계산
+        led_value = get_led_pattern(current_pattern, current_step);
+
+        // 다음 단계로 이동
+        if (current_dir == FWD) {
+            step++;
+
+            if (step >= max_step)
+                step = 0;
+        }
+        else {
+            step--;
+
+            if (step < 0)
+                step = max_step - 1;
+        }
+    }
+    else {
+        led_value = -1;
+    }
+
+    spin_unlock_irqrestore(&seq_lock, flags);
+
+    // 스핀락 밖에서 LED 출력
+    if (led_value != -1)
+        led_output(led_value);
+
+    // 다음 타이머 실행 예약
+    mod_timer(timer, jiffies + msecs_to_jiffies(current_period));
+}
+
+
+// 스위치 IRQ 핸들러
+static irqreturn_t irq_handler(int irq, void *dev_id)
+{
+    unsigned long flags;
+    int sw_index;
+    int current_pattern;
+    int current_period;
+    int current_dir;
+    int current_run;
+
+    sw_index = (int)(long)dev_id;
+
+    if (sw_index < 0 || sw_index >= 4)
+        return IRQ_NONE;
+
+    spin_lock_irqsave(&seq_lock, flags);
+
+    // 200ms 이내 같은 스위치의 반복 입력 무시
+    if (sw_pressed[sw_index] &&
+        time_before(jiffies,
+                    last_sw_jiffies[sw_index] +
+                    msecs_to_jiffies(DEBOUNCE_MS))) {
+
+        spin_unlock_irqrestore(&seq_lock, flags);
+        return IRQ_HANDLED;
+    }
+
+    last_sw_jiffies[sw_index] = jiffies;
+    sw_pressed[sw_index] = 1;
+
+    switch (sw_index) {
+
+        case 0:
+            // 패턴 변경 A -> B -> C -> A
+            pattern = (pattern + 1) % 3;
+
+            // 새 패턴의 첫 단계로 이동
+            if (dir == FWD)
+                step = 0;
+            else
+                step = get_step_count(pattern) - 1;
+
+            break;
+
+        case 1:
+            // 속도 변경 1000 -> 500 -> 250 -> 1000
+            if (period_ms == 1000)
+                period_ms = 500;
+            else if (period_ms == 500)
+                period_ms = 250;
+            else
+                period_ms = 1000;
+
+            break;
+
+        case 2:
+            // 방향 변경
+            dir = (dir == FWD) ? REV : FWD;
+            break;
+
+        case 3:
+            // 실행 / 일시정지
+            run = !run;
+            break;
+    }
+
+    current_pattern = pattern;
+    current_period = period_ms;
+    current_dir = dir;
+    current_run = run;
+
+    spin_unlock_irqrestore(&seq_lock, flags);
+
+    printk(KERN_INFO
+           "[led_seq] sw=%d -> pattern=%c period=%d dir=%s run=%d\n",
+           sw_index,
+           'A' + current_pattern,
+           current_period,
+           current_dir == FWD ? "FWD" : "REV",
+           current_run);
+
+    return IRQ_HANDLED;
+}
+
+static int p1_init(void)
+{
+    int i;
+    int res;
+
+    // 스위치 GPIO 요청 및 입력 설정
+    for (i = 0; i < 4; i++) {
+
+        res = gpio_request(sw[i], "SW");
+
+        if (res < 0)
+            goto error;
+
+        sw_requested[i] = 1;
+
+        res = gpio_direction_input(sw[i]);
+
+        if (res < 0)
+            goto error;
+    }
+
+    // LED GPIO 요청 및 출력 설정
+    for (i = 0; i < LED_COUNT; i++) {
+
+        res = gpio_request(led[i], "LED");
+
+        if (res < 0)
+            goto error;
+
+        led_requested[i] = 1;
+
+        res = gpio_direction_output(led[i], LOW);
+
+        if (res < 0)
+            goto error;
+    }
+
+    // 스위치 IRQ 등록
+    for (i = 0; i < 4; i++) {
+
+        irq_num[i] = gpio_to_irq(sw[i]);
+
+        if (irq_num[i] < 0) {
+            res = irq_num[i];
+            goto error;
+        }
+
+        res = request_irq(
+            irq_num[i],
+            irq_handler,
+            IRQF_TRIGGER_RISING,
+            "led_seq",
+            (void *)(long)i
+        );
+
+        if (res < 0)
+            goto error;
+
+        irq_requested[i] = 1;
+    }
+
+    // 타이머 초기화 및 최초 실행 예약
+    timer_setup(&timer, timer_cb, 0);
+
+    mod_timer(&timer,
+              jiffies + msecs_to_jiffies(period_ms));
+
+    printk(KERN_INFO "[led_seq] loaded\n");
+
+    return 0;
+
+
+error:
+
+    // 이미 등록된 IRQ 해제
+    for (i = 0; i < 4; i++) {
+        if (irq_requested[i]) {
+            free_irq(irq_num[i], (void *)(long)i);
+            irq_requested[i] = 0;
+        }
+    }
+
+    // 요청한 LED GPIO 해제
+    for (i = 0; i < 4; i++) {
+        if (led_requested[i]) {
+            gpio_free(led[i]);
+            led_requested[i] = 0;
+        }
+    }
+
+    // 요청한 스위치 GPIO 해제
+    for (i = 0; i < 4; i++) {
+        if (sw_requested[i]) {
+            gpio_free(sw[i]);
+            sw_requested[i] = 0;
+        }
+    }
+
+    printk(KERN_ERR "[led_seq] init failed\n");
+
+    return res;
+}
+
+static void p1_exit(void)
+{
+    int i;
+
+    // 타이머 콜백이 끝날 때까지
+    del_timer_sync(&timer);
+
+    // IRQ 해제
+    for (i = 0; i < 4; i++) {
+        if (irq_requested[i]) {
+            free_irq(irq_num[i], (void *)(long)i);
+            irq_requested[i] = 0;
+        }
+    }
+
+    //LED 끄기
+    for (i = 0; i < 4; i++) {
+        if (led_requested[i])
+            gpio_set_value(led[i], LOW);
+    }
+
+    // GPIO 해제(led)
+    for (i = 0; i < 4; i++) {
+        if (led_requested[i]) {
+            gpio_free(led[i]);
+            led_requested[i] = 0;
+        }
+    }
+	
+	//(switch)
+    for (i = 0; i < 4; i++) {
+        if (sw_requested[i]) {
+            gpio_free(sw[i]);
+            sw_requested[i] = 0;
+        }
+    }
+
+    printk(KERN_INFO "[led_seq] unloaded\n");
+}
+
+module_init(p1_init);
+module_exit(p1_exit);
+MODULE_LICENSE("GPL");
